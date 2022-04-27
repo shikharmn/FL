@@ -13,7 +13,7 @@ from omegaconf import OmegaConf
 import numpy as np
 
 config = """
-logs_dir: './runs'
+logs_dir: './runs_model2'
 dataset: 'MNIST'
 classes: 10
 batch_size: 256
@@ -28,7 +28,14 @@ uniform:
 
 cfg = OmegaConf.create(config)
 
-device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+device = 'cuda:1' if torch.cuda.is_available() else 'cpu'
+
+def label_avg(check_list):
+    averaged_label = 0
+    for i in range(min_len):
+        _, label = dataset_train[check_list[i]]
+        averaged_label += label/min_len
+    return averaged_label
 
 def fusion(models):
   state_dicts = [model.state_dict() for model in models]
@@ -48,6 +55,7 @@ class CNN_FedAvg(nn.Module):
         self.conv2d_1 = torch.nn.Conv2d(1, 32, kernel_size=5, padding=2)
         self.max_pooling = nn.MaxPool2d(2, stride=2)
         self.conv2d_2 = torch.nn.Conv2d(32, 64, kernel_size=5, padding=2)
+        self.conv2d_3 = torch.nn.Conv2d(64, 64, kernel_size=5, padding=2)
         self.flatten = nn.Flatten()
         self.linear_1 = nn.Linear(3136, 512)
         self.linear_2 = nn.Linear(512, classes)
@@ -102,13 +110,14 @@ data_idx = np.asarray(data_idx)
 
 idx_shuffles = [min_len // sim_fraction for sim_fraction in [min_len+1,10,2,1]]
 
-idx_splits_shuffled = [shuffle_along_axis(data_idx[:,:idx_shuffle]) for idx_shuffle in idx_shuffles]
+idx_splits_shuffled = [shuffle_along_axis(data_idx.copy()[:,:idx_shuffle]) for idx_shuffle in idx_shuffles]
 
 idx_shuffled_data = []
 for idx_shuffle, idx_split_shuffled in zip(idx_shuffles, idx_splits_shuffled):
     new_data = data_idx
-    new_data[:,:idx_shuffle] = idx_split_shuffled
-    idx_shuffled_data.append(new_data)
+    if idx_shuffle != 0:
+        new_data[:,:idx_shuffle] = idx_split_shuffled
+    idx_shuffled_data.append(new_data.copy())
 
 hetero_dataloaders = [[] for i in range(4)]
 for idx_sim,idxs in enumerate(idx_shuffled_data):
@@ -118,11 +127,11 @@ for idx_sim,idxs in enumerate(idx_shuffled_data):
                                                batch_size=cfg.batch_size,
                                                shuffle=True, drop_last=False))
 
-for similarity,train_loaders in zip(["0","10","50","100"],hetero_dataloaders):
-    for local_steps in [1,16,64,256,2048]:
+for similarity,train_loaders in zip(["0"],hetero_dataloaders[:1]):
+    for local_steps in [2048]:
         client_models = [CNN_FedAvg() for i in range(cfg.uniform.workers)]
 
-        writer = SummaryWriter(cfg.logs_dir + '/hetero_' + similarity + '_' + str(local_steps))
+        writer = SummaryWriter(cfg.logs_dir + '/hetero_fixed' + similarity + '_' + str(local_steps))
         criterion = nn.NLLLoss()
 
         for i in range(cfg.uniform.workers): client_models[i] = client_models[i].to(cfg.device)
@@ -169,7 +178,6 @@ for similarity,train_loaders in zip(["0","10","50","100"],hetero_dataloaders):
                         pred = output.max(1, keepdim=True)[1]
                         correct += pred.eq(target.view_as(pred)).sum().item()
 
-                test_loss /= len(test_loader.dataset)
                 acc = 100. * correct / len(test_loader.dataset)
                 writer.add_scalar('test/Loss', test_loss, step)
                 writer.add_scalar('test/Accuracy', acc, step)
