@@ -20,7 +20,7 @@ batch_size: 256
 device: 'cuda:0'
 epochs: 40
 steps:
-  total: 12000
+  total: 4000
   local: 16
 uniform:
   workers: 10
@@ -32,17 +32,40 @@ device = 'cuda:1' if torch.cuda.is_available() else 'cpu'
 
 def label_avg(check_list):
     averaged_label = 0
+    stats = np.zeros((10,1))
     for i in range(min_len):
         _, label = dataset_train[check_list[i]]
+        stats[label] += 1.0
         averaged_label += label/min_len
+    print(1.0 * stats/stats.sum())
     return averaged_label
 
-def fusion(models):
-  state_dicts = [model.state_dict() for model in models]
-  for key in state_dicts[0]:
-    state_dicts[0][key] = sum([state_dict[key] for state_dict in state_dicts]) / cfg.uniform.workers
-    for state_dict in state_dicts: state_dict[key] = state_dicts[0][key]
-  return models
+def fusion(models, optimizers):
+    state_dicts = [model.state_dict() for model in models]
+    model_averaged = CNN_FedAvg().to(device)
+    for key in state_dicts[0]:
+        model_averaged.state_dict()[key] = sum([state_dict[key] for state_dict in state_dicts]) / cfg.uniform.workers
+    for idx in range(len(models)):
+        models[idx].load_state_dict(model_averaged.state_dict())
+    optimizers = [optim.SGD(model.parameters(), lr = 0.002) for model in models]
+    return models, optimizers, model_averaged
+
+def fusion_2(models, optimizers):
+    parameters = [model.named_parameters() for model in models]
+    model_averaged = CNN_FedAvg().to(device)
+    dict_params_avg = dict(model_averaged.named_parameters())
+    dicts_params = [dict(parameter) for parameter in parameters]
+
+    for name, _ in parameters[0]:
+        if name in dict_params_avg:
+            dict_params_avg[name].data.copy_(sum([dict_params[name].data for dict_params in dicts_params]))
+
+    model_averaged.load_state_dict(dict_params_avg)
+    for idx in range(len(models)):
+        models[idx].load_state_dict(dict_params_avg)
+    optimizers = [optim.SGD(model.parameters(), lr = 0.002) for model in models]
+
+    return models, optimizers, model_averaged
 
 def shuffle_along_axis(a, axis=0):
     idx = np.random.rand(*a.shape).argsort(axis=axis)
@@ -127,11 +150,11 @@ for idx_sim,idxs in enumerate(idx_shuffled_data):
                                                batch_size=cfg.batch_size,
                                                shuffle=True, drop_last=False))
 
-for similarity,train_loaders in zip(["0"],hetero_dataloaders[:1]):
-    for local_steps in [2048]:
+for similarity,train_loaders in zip(["10"],hetero_dataloaders[1:2]):
+    for local_steps in [4, 16, 64]:
         client_models = [CNN_FedAvg() for i in range(cfg.uniform.workers)]
 
-        writer = SummaryWriter(cfg.logs_dir + '/hetero_fixed' + similarity + '_' + str(local_steps))
+        writer = SummaryWriter(cfg.logs_dir + '/hetero_fixed_2' + similarity + '_' + str(local_steps))
         criterion = nn.NLLLoss()
 
         for i in range(cfg.uniform.workers): client_models[i] = client_models[i].to(cfg.device)
@@ -140,7 +163,7 @@ for similarity,train_loaders in zip(["0"],hetero_dataloaders[:1]):
         data_iters = [iter(dataloader) for dataloader in train_loaders]
         for model in client_models: model.to(device)
         for step in tqdm(range(cfg.steps.total)):
-            client_models[0].train()
+            for model in client_models: model.train()
 
             # Get data from the dataloaders
             try:
@@ -154,6 +177,12 @@ for similarity,train_loaders in zip(["0"],hetero_dataloaders[:1]):
             # Train
             for optimizer in optimizers: optimizer.zero_grad()
             outputs = [model(data.squeeze(1)) for model, (data, _) in zip(client_models, data_pairs)]
+            preds = [output.max(1, keepdim=True)[1] for output in outputs]
+            for idx, (_, labels) in enumerate(data_pairs):
+                writer.add_scalar(f'debug/worker_{idx}/gt_mean', labels.float().mean().item(), step)
+                writer.add_scalar(f'debug/worker_{idx}/gt_std', labels.float().std().item(), step)
+                writer.add_scalar(f'debug/worker_{idx}/pred_mean', preds[idx].float().mean().item(), step)
+                writer.add_scalar(f'debug/worker_{idx}/pred_std', preds[idx].float().std().item(), step)
             losses = [criterion(output, target) for output, (_, target) in zip(outputs, data_pairs)]
             for loss in losses: loss.backward()
             for optimizer in optimizers: optimizer.step()
@@ -163,21 +192,26 @@ for similarity,train_loaders in zip(["0"],hetero_dataloaders[:1]):
 
             # Fusion
             if step % local_steps == 0 and idx != 0:
-                client_models = fusion(client_models)
+                client_models, optimizers, averaged_model = fusion_2(client_models, optimizers)
 
             if step % local_steps == 0 or step % local_steps == local_steps - 1:
               # Testing
-                client_models[0].eval()
+                averaged_model.eval()
                 test_loss = 0
                 correct = 0
+                preds = []
                 with torch.no_grad():
                     for data, target in tqdm(test_loader):
                         data, target = data.to(device), target.to(device)
-                        output = client_models[0](data.squeeze(1))
+                        output = averaged_model(data.squeeze(1))
                         test_loss += criterion(output, target).item()
                         pred = output.max(1, keepdim=True)[1]
+                        preds.append(pred.cpu().numpy())
                         correct += pred.eq(target.view_as(pred)).sum().item()
 
                 acc = 100. * correct / len(test_loader.dataset)
+                preds = np.concatenate(preds)
+                writer.add_scalar('test/pred_mean', preds.mean(), step)
+                writer.add_scalar('test/pred_std', preds.std(), step)
                 writer.add_scalar('test/Loss', test_loss, step)
                 writer.add_scalar('test/Accuracy', acc, step)
